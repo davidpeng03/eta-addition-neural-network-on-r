@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Nov 23 12:12:04 2023
+
+@author: david
+"""
+import matplotlib.figure as figure
+import matplotlib.colors as colors
+from tensorflow.keras import layers, models, regularizers
+
+import numpy
+import awkward
+import tensorflow as tf
+import tensorflow.keras as keras
+import tensorflow.keras.layers as layers
+import tensorflow.keras.losses as losses
+import tensorflow.keras.activations as activations
+import tensorflow.keras.backend as backend
+from Sum import Sum
+
+
+# pads inputs with nans up to the given maxsize
+def nanpad(xs, maxsize):
+  ys = \
+    awkward.fill_none \
+    ( awkward.pad_none(xs, maxsize, axis=1)
+    , numpy.float32('nan')
+    , axis=None
+    )[:,:maxsize]
+
+  return awkward.to_regular(ys, axis=1)
+
+
+# flattens the axis=1 dimension (e.g. events x jets -> jets)
+def flatten1(xs, maxsize=-1):
+  ys = {}
+  for field in xs.fields:
+    zs = awkward.flatten(xs[field], axis=1)
+    if maxsize > 0:
+      zs = nanpad(zs, maxsize)
+    ys[field] = zs
+
+  return awkward.zip(ys)
+
+
+# converts pt, eta, phi to px, py, pz, maintaining any additional information
+def ptetaphi2pxpypz(ptetaphi):
+  pts = ptetaphi[:,0:1]
+  etas = ptetaphi[:,1:2]
+  phis = ptetaphi[:,2:3]
+
+  pxs = pts * numpy.cos(phis)
+  pys = pts * numpy.sin(phis)
+  pzs = pts * numpy.sinh(etas)
+
+  isinf = numpy.isinf(pzs)
+
+  if numpy.any(isinf):
+    print("inf from eta:")
+    print(etas[isinf])
+    raise ValueError("infinity from sinh(eta)")
+
+  return numpy.concatenate([pxs, pys, pzs, ptetaphi[:,3:]], axis=1)
+
+
+# converts pt, eta, phi to px, py, pz, maintaining any additional information,
+# but works on the second axis rather than the first
+def ptetaphi2pxpypzV(ptetaphi):
+  pts = ptetaphi[:,:,0:1]
+  etas = ptetaphi[:,:,1:2]
+  phis = ptetaphi[:,:,2:3]
+
+  pxs = pts * numpy.cos(phis)
+  pys = pts * numpy.sin(phis)
+  pzs = pts * numpy.sinh(etas)
+
+  isinf = numpy.isinf(pzs)
+
+  if numpy.any(isinf):
+    print("inf from eta:")
+    print(etas[isinf])
+    raise ValueError("infinity from sinh(eta)")
+
+  return numpy.concatenate([pxs, pys, pzs, ptetaphi[:,:,3:]], axis=2)
+
+
+def buildModel(jetlayers,etalayers,flavourlayers,clusterlayers, maskval):
+  regularization_rate = 0.01
+  dropout_rate = 0.03
+  
+  jetinputs = layers.Input(shape=jetlayers[0])
+  flavourinputs = layers.Input(shape=flavourlayers[0])
+  
+  #outputs = layers.Concatenate()([jetinputs, trackoutputs, clusteroutputs])
+  #not sure if this correct but swtiched above with below
+  
+  
+  clusterinputs = layers.Input(shape=(None, clusterlayers[0]))
+  etainputs = layers.Input(shape=etalayers[0])
+  
+  outputs = clusterinputs
+  outputs = layers.Masking(mask_value=maskval)(outputs)
+  
+  for nodes in clusterlayers[1:-1]:
+    outputs = layers.TimeDistributed(layers.Dense(nodes, activation='relu'))(outputs)
+    outputs = layers.BatchNormalization()(outputs)
+    
+  
+  outputs = layers.TimeDistributed(layers.Dense(clusterlayers[-1], activation='softmax'))(outputs)
+  clusteroutputs = Sum()(outputs)
+  
+  concatenated_inputs = layers.Concatenate()([jetinputs, flavourinputs, clusteroutputs])
+
+  outputs = concatenated_inputs
+
+  for nodes in jetlayers[1:]:
+    outputs = layers.Dense(nodes, activation='relu', kernel_regularizer=regularizers.l2(regularization_rate))(outputs)
+    outputs = layers.BatchNormalization()(outputs)
+    outputs = layers.Dropout(dropout_rate)(outputs)
+    
+  for nodes in flavourlayers[1:]:
+    outputs = layers.Dense(nodes, activation='relu', kernel_regularizer=regularizers.l2(regularization_rate))(outputs)
+    outputs = layers.BatchNormalization()(outputs)
+    outputs = layers.Dropout(dropout_rate)(outputs)
+    
+  for nodes in etalayers[1:]:
+        outputs = layers.Dense(nodes, activation='relu', kernel_regularizer=regularizers.l2(regularization_rate))(outputs)
+        outputs = layers.BatchNormalization()(outputs)
+        outputs = layers.Dropout(dropout_rate)(outputs)
+  
+
+  outputs = layers.Dense(2)(outputs)
+  #outputs[1] +=1
+  #jetinputs = tf.reshape(jetinputs,shape=(32,1))
+
+  return keras.Model( inputs=[jetinputs,etainputs,flavourinputs, clusterinputs] , outputs=outputs )
+
+
+def LogNormalNoCov(true, pred):
+  mus = pred[:,:4]
+  logsigmas = pred[:,4:]
+  dist2 = ((true - mus) / backend.exp(logsigmas))**2 / 2.0
+  return backend.mean(backend.sum(dist2 + logsigmas + 0.5*numpy.log(2.0 * numpy.pi), axis=1))
+
+
+def gaussian(mu, sigma, normalized=True):
+  sigma2 = sigma**2
+
+  def f(x):
+    main = numpy.exp(- (x - mu)**2 / (2*sigma2))
+    if normalized:
+      return main / (numpy.sqrt(2*numpy.pi)*sigma)
+    else:
+      return main
+
+  return f
+
+
+def inrange(mn , xs , mx):
+  return numpy.logical_and(mn < xs, xs < mx)
+
+
+def centralGauss(xs, normalized=True):
+  avg = numpy.mean(xs)
+  std = numpy.std(xs)
+
+  masked = xs[inrange(avg - 2*std , xs , avg + 2*std)]
+
+  return gaussian(numpy.mean(masked), numpy.std(masked), normalized)
+
+
+# adds the pt back
+def addpt(pxpy):
+  pt = numpy.sqrt(pxpy[:,0:1]**2 + pxpy[:,1:2]**2)
+  return numpy.concatenate([pxpy, pt], axis=1)
+
+
+def plot_pdf_with_gauss(fig, xs, labels, binning, xlabel=None, ylabel=None):
+  plt = fig.add_subplot(111)
+  for x , label in zip(xs, labels):
+    vals , bins = numpy.histogram(x, bins=binning, density=False)
+    vals = vals / x.shape[0] / (bins[1] - bins[0])
+
+    plt.plot((bins[:-1] + bins[1:]) / 2.0, vals, label=label)
+
+  if xlabel is not None:
+    plt.set_xlabel(xlabel)
+  if ylabel is not None:
+    plt.set_ylabel(ylabel)
+
+  avg = numpy.mean(xs[0])
+  std = numpy.std(xs[0])
+  gaus = centralGauss(xs[0])
+
+  xs = numpy.mgrid[bins[0]:bins[-1]:101j] 
+  plt.plot(xs, gaus(xs), "--", color="black", label="$\\mu = %.2f, \\sigma = %.2f$" % (avg , std))
+
+  plt.legend()
+
+  return fig
+
+
+binning = \
+  { "px" : (numpy.mgrid[-100:100:101j], numpy.mgrid[-100:100:101j])
+  , "py" : (numpy.mgrid[-100:100:101j], numpy.mgrid[-100:100:101j])
+  , "pz" : (numpy.mgrid[-100:100:101j], numpy.mgrid[-100:100:101j])
+  , "E"  : (numpy.mgrid[-100:100:101j], numpy.mgrid[0:200:101j])
+  , "pt" : (numpy.mgrid[-100:100:101j], numpy.mgrid[0:200:101j])
+  }
+
+
+def reghists(regressed, initial, targets, epoch):
+  # remove uncertainties for now
+  print("test")
+  regressed = addpt(regressed)
+  initial = addpt(initial)
+  targets = addpt(targets)
+
+  alldiffs = regressed - targets
+  ialldiffs = initial - targets
+
+  allreldiffs = alldiffs / targets
+  iallreldiffs = ialldiffs / targets
+
+  fig = figure.Figure()
+  print("test")
+  for pidx, pname in enumerate(["px", "py", "pz", "E", "pt"]):
+
+    diffs = alldiffs[:, pidx]
+    idiffs = ialldiffs[:, pidx]
+
+    fig = plot_pdf_with_gauss \
+      ( fig
+      , [diffs, idiffs]
+      , ["regressed", "initial"]
+      , binning=binning[pname][0]
+      , xlabel="$\Delta$ %s [GeV]" % pname
+      , ylabel="probability density"
+      )
+
+    fig.savefig("figs/%s-diff-%03d.png" % (pname, epoch))
+    fig.clf()
+
+    reldiffs = allreldiffs[:, pidx]
+    ireldiffs = iallreldiffs[:, pidx]
+
+    fig = plot_pdf_with_gauss \
+      ( fig
+      , [reldiffs, ireldiffs]
+      , ["regressed", "initial"]
+      , binning=numpy.mgrid[-2:2:101j]
+      , xlabel="relative $\Delta$ %s" % pname
+      , ylabel="probability density"
+      )
+
+    fig.savefig("figs/%s-reldiff-%03d.png" % (pname, epoch))
+    fig.clf()
+
+
+    plt = fig.add_subplot(111)
+    plt.hist2d \
+      ( targets[: , pidx]
+      , regressed[: , pidx]
+      , bins=binning[pname][1]
+      , norm=colors.LogNorm()
+      )
+
+    fig.savefig("figs/%s-response-%03d.png" % (pname, epoch))
+    fig.clf()
+
+
+  return
+'''
+
+
+def reghists(regressed, initial, targets, epoch):
+  # remove uncertainties for now
+
+  regressed = addpt(regressed)
+  initial = addpt(initial)
+  targets = addpt(targets)
+
+  alldiffs = regressed - targets
+  ialldiffs = initial - targets
+
+  allreldiffs = alldiffs / targets
+  iallreldiffs = ialldiffs / targets
+
+  fig = figure.Figure()
+
+  for pidx, pname in enumerate(["px", "py", "pz", "E", "pt"]):
+
+    diffs = alldiffs[:, pidx]
+    idiffs = ialldiffs[:, pidx]
+
+    fig = plot_pdf_with_gauss \
+      ( fig
+      , [diffs, idiffs]
+      , ["regressed", "initial"]
+      , binning=binning[pname][0]
+      , xlabel="$\Delta$ %s [GeV]" % pname
+      , ylabel="probability density"
+      )
+
+    fig.savefig("figs/%s-diff-%03d.png" % (pname, epoch))
+    fig.clf()
+
+    reldiffs = allreldiffs[:, pidx]
+    ireldiffs = iallreldiffs[:, pidx]
+
+    fig = plot_pdf_with_gauss \
+      ( fig
+      , [reldiffs, ireldiffs]
+      , ["regressed", "initial"]
+      , binning=numpy.mgrid[-2:2:101j]
+      , xlabel="relative $\Delta$ %s" % pname
+      , ylabel="probability density"
+      )
+
+    fig.savefig("figs/%s-reldiff-%03d.png" % (pname, epoch))
+    fig.clf()
+
+
+    plt = fig.add_subplot(111)
+    plt.hist2d \
+      ( targets[: , pidx]
+      , regressed[: , pidx]
+      , bins=binning[pname][1]
+      , norm=colors.LogNorm()
+      )
+
+    fig.savefig("figs/%s-response-%03d.png" % (pname, epoch))
+    fig.clf()
+
+
+  return
+'''
