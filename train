@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Nov 23 12:11:53 2023
+
+@author: davidƒ
+"""
+
+import tensorflow.keras.callbacks as callbacks
+import tensorflow.keras as keras
+import tensorflow as tensorflow
+from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler, LambdaCallback
+from keras.layers import Dropout
+import numpy as np
+import awkward
+import uproot
+import h5py
+from scipy.stats import gaussian_kde
+import matplotlib.pyplot as plt
+import math
+from utils import *
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.utils import shuffle
+from Sum import Sum
+from matplotlib.colors import LinearSegmentedColormap
+
+# Get the "inferno" colormap
+inferno_cmap = plt.get_cmap('inferno')
+
+# Number of colors in the custom colormap
+num_colors = 256
+
+# Create a custom colormap with white at the end
+colors = inferno_cmap(np.linspace(0, 1, num_colors))
+colors[-1] = [1, 1, 1, 1]  # Set the last color to white (RGBA format)
+
+custom_cmap = LinearSegmentedColormap.from_list('inferno_white', colors, N=num_colors)
+
+
+# Get the "inferno_white" colormap
+inferno_white_cmap = plt.get_cmap(custom_cmap)
+
+# Reverse the order of colors
+colors_reversed = inferno_white_cmap(np.linspace(1, 0, inferno_white_cmap.N))
+
+# Create a reversed colormap
+inferno_white_reversed_cmap = LinearSegmentedColormap.from_list('inferno_white_reversed', colors_reversed, N=inferno_white_cmap.N)
+
+
+# this should all be moved to a json config file...
+MASKVAL = -999
+MAXTRACKS = 32
+MAXCLUSTERS = 32
+BATCHSIZE = 32
+EPOCHSIZE = 10000
+MAXEVENTS = 2000000
+# VALFACTOR = 3
+LR = 3e-5
+#can turn up for testing
+FNAME = "/Users/david/Downloads/jets.h5"
+
+
+flavourlayers = [ 16 , 16 , 16 , 16 ]
+etalayers = [ 16 , 16 , 16 , 16 ]
+clusterlayers = [ 16 , 16 , 16 , 16 ]
+jetlayers = [ 64 , 64 , 64 , 64, 64 ]
+
+evtfeatures = [ "eventNumber" ]
+truejetfeatures = [ "jet_true_pt"]
+jetfeatures = [ "jet_pt" ]
+clusterfeatures = ["jet_constit_pt"]
+flavourfeatures = [ "jet_PartonTruthLabelID"]
+etafeatures = ["eta"]
+
+# Learning Rate Scheduler
+def scheduler(epoch, lr):
+    if epoch < 7:
+        print(f"Epoch {epoch + 1}: Keeping learning rate {lr}")
+        return lr
+    elif epoch < 40: 
+        new_lr = 3e-5
+    elif epoch < 60: 
+        new_lr = 3e-6
+    else:
+        new_lr = lr * tensorflow.math.exp(-0.1)
+
+    print(f"Epoch {epoch + 1}: Updating learning rate to {new_lr}")
+    return new_lr
+    
+lr_scheduler = LearningRateScheduler(scheduler)
+
+
+    
+    
+jets=h5py.File("/Users/david/Downloads/jets.h5","r") # reading the file
+# Extracting dataset values
+jet_pt = jets['jet_pt'][:]
+jet_px = jets['jet_px'][:]
+jet_py = jets['jet_py'][:]
+jet_pz = jets['jet_pz'][:]
+jet_E = jets['jet_E'][:]
+jet_true_pt = jets['jet_true_pt'][:]
+jet_true_px = jets['jet_true_px'][:]
+jet_true_py = jets['jet_true_py'][:]
+jet_true_pz = jets['jet_true_pz'][:]
+jet_true_E = jets['jet_true_e'][:]
+flavour  = jets["jet_PartonTruthLabelID"][:]
+cluster  = jets["jet_constit_pt"][:]
+
+low_pt_cut = jet_true_pt > 25
+jet_pt = jet_pt[low_pt_cut]
+jet_true_pt = jet_true_pt[low_pt_cut]
+jet_pz = jet_pz[low_pt_cut]
+flavour = flavour[low_pt_cut] 
+cluster = cluster[low_pt_cut]
+print(min(jet_pt))
+"there are wrong values below 25 but no actual jets below 25?"
+theta = np.arctan2(jet_pt,jet_pz)
+eta = -np.log(np.tan(theta/2))
+
+#feature_scaler = StandardScaler()
+#output_scaler = StandardScaler()
+
+#Data sets
+
+#shuffled_indices = np.random.permutation(len(jet_pt))
+#shuffled_jet_pt = jet_pt[shuffled_indices]
+#shuffled_jet_true_pt = jet_true_pt[shuffled_indices]
+#jet_pt, jet_true_pt = shuffle(jet_pt,jet_true_pt, random_state=0)
+#feature_scaler = StandardScaler()
+#output_scaler = StandardScaler()
+
+train_size = int(len(jet_pt) * 0.8)     
+test_size = jet_pt - train_size
+"""
+jet_pt = jet_pt - jet_true_pt
+actual_jet_true_pt = jet_true_pt
+jet_true_pt = jet_true_pt - jet_true_pt
+"""
+trainsizedeta = eta[:train_size]
+test_eta = eta[train_size:]
+r_target = jet_pt/jet_true_pt
+train_inputflavour = flavour[:train_size]
+train_inputcluster = cluster[:train_size]
+train_input, test_input = [jet_pt[:train_size],trainsizedeta,train_inputflavour,train_inputcluster], [jet_pt[train_size:],test_eta,flavour[train_size:],cluster[train_size:]]
+
+train_target, test_target = r_target[:train_size], r_target[train_size:]
+
+original_r = r_target
+
+
+
+from numpy.lib.recfunctions import structured_to_unstructured
+
+def loss_function(y_true,y_pred):
+    #y_pred = tf.math.exp(y_pred)
+    #loss = - np.log(normpdf(true_pt, pred[0], pred[1]))
+    
+    logsigma = y_pred[:,1]
+    mu = y_pred[:,0]
+    print(mu)
+    print(logsigma)
+    print(y_true)
+
+    loss = pow((mu - y_true[:,0]), 2) / (2 * pow(tensorflow.math.exp(logsigma), 2)) + \
+           logsigma
+        
+    print(loss)
+           
+    return tf.math.reduce_mean(loss)
+
+model = \
+  buildModel \
+    ( [ len(jetfeatures) ] + jetlayers
+     , [ len(flavourfeatures) ] + flavourlayers
+     ,[ len(clusterfeatures) ] + clusterlayers
+     ,[ len(etafeatures) ] + etalayers
+    , MASKVAL
+    )
+
+epoch = 0
+
+
+def mean_sigma_cuttings(r_or_delta, cuttings,cuttingsparameter, exp= True, negatives = False):
+    #cuttingsparameter[:train_size] lets u pick pt or eta
+    #i think dont need variable for pt,px,py,pz cuz its built into r or delta
+    
+    midpoints = []
+    
+
+    cuttingsparameter = cuttingsparameter[:train_size]
+    cut_parameter_list = []
+    
+    if negatives == False:
+        midpoints.append(cuttings[0]/2)
+
+                  
+        firstcut = cuttingsparameter[:train_size]<cuttings[0]
+        another_test = r_or_delta[firstcut]
+        cut_parameter_list.append(r_or_delta[firstcut])
+        
+    for i in range(len(cuttings)-1):
+  
+        midpoints.append((cuttings[i]+cuttings[i+1])/2)
+
+            
+        lower_cut = cuttingsparameter[:train_size]>cuttings[i]
+        upper_cut = cuttingsparameter[:train_size]<cuttings[i+1]
+        full_cut = lower_cut*upper_cut
+        cut_parameter_list.append(r_or_delta[full_cut])
+
+            
+    #finalcut = regressed>cuttings[len(cuttings)-1]
+    #cut_parameter_list.append(r[finalcut])
+    #cuz using midpoints of values cant have final cut to infinity
+    """
+    
+    if exp == True:
+        #cuttings = np.exp(cuttings)
+        midpoints = np.exp(midpoints)
+        
+    """
+    
+    # should be the seperated bins of r
+    
+    cut_parameter_list = np.array(cut_parameter_list)
+    cutmeanvalue = []
+    cutsigmavalue = []
+    for i in range(len(cut_parameter_list)):
+        '''
+        total = 0
+        totalamount = 0
+        squaredmeanvaluediffsum = 0
+        for j in range(len(cut_parameter_list[i])):
+            totalamount += cut_parameter_list[i][j]
+            total += 1
+        mean = totalamount/total
+        for j in range(len(cut_parameter_list[i])):
+            squaredmeanvaluediffsum += (cut_parameter_list[i][j] - mean)**2
+        sigma = math.sqrt(squaredmeanvaluediffsum/total)
+        '''
+        mean = np.mean(cut_parameter_list[i])
+        sigma = np.std(cut_parameter_list[i])
+        cutmeanvalue.append(mean)
+        cutsigmavalue.append(sigma)
+    return midpoints,cutmeanvalue,cutsigmavalue
+#model = tf.keras.models.load_model("/Users/david/neuralnetworkwithflavourandclustors.keras", custom_objects={ 'loss': loss_function, 'CustomClass': Sum },compile=False)
+model.summary()
+
+
+
+model.compile \
+  ( loss = loss_function
+   #loss = tensorflow.keras.losses.Huber()
+  , optimizer = keras.optimizers.Adam(learning_rate=LR)
+  )
+  
+
+# Early Stopping
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1, mode='min', restore_best_weights=True)
+
+while 1:
+    
+
+  print("plotting")
+  # regressed = model.predict(train_input.reshape(-1,1))
+# -1 lets it figure out the size for us  
+#think this is wrong as the regresesd changed to just jets so might have to be [:,2] or something like that
+  
+#[:] means takes all the rows
+#[:4] means takes the first 4 colomns
+
+  print("epoch %03d" % epoch)
+  model.fit \
+    ( [train_input]
+    , train_target
+    , batch_size=BATCHSIZE
+    , epochs=1
+    , steps_per_epoch=EPOCHSIZE
+    , validation_data=(test_input, test_target)
+    , callbacks=[early_stopping, lr_scheduler]
+    # , validation_data=(valinputs, {"classification" : valclasstargets, "regression" : valkintargets })
+    # , callbacks=[callbacks.ReduceLROnPlateau(verbose=1)]
+    )
+
+  model.save("/Users/david/flavourclustorneuralnetwork2.keras")
+  #reconstructed_model = keras.models.load_model("my_model.keras")
+
+
+  regressed = model.predict(train_input)
+  if numpy.any(numpy.isnan(regressed)) or numpy.any(numpy.isinf(regressed)):
+    print("NaN or Inf values detected in 'regressed'")
+#if (epoch + 1) % 1 == 0:
+  #plotting
+  #returning to 1 + x
+  #scatter plot
+  r = regressed[:,0]
+  
+  #r = r + 0.00000000000001
+  mu = jet_pt[:train_size]/regressed[:,0]
+  #mu = np.where(np.isfinite(mu), mu, 0)
+  
+  logsigma = regressed[:,1]
+  #train_target = 
+  print("Regressed:", max(regressed[:,0]))
+  print("sigma:", max(regressed[:,1]))
+  print("mu:", max(mu))
+
+  
+  
+  test1 = regressed[:,1]
+  plt.rcParams["figure.figsize"] = [5,5]
+  if epoch % 1 == 0:
+      
+        plt.figure()
+        ax = plt.gca()
+        ax.set_ylim([0, 6000])
+        #plt.scatter(train_target, regressed[:,0], c='orange', marker='x', s=5)
+        plt.hist2d(jet_true_pt[:train_size], mu,bins =300,range=[[0,6000],[0,6000]], cmap = inferno_white_reversed_cmap)
+        np.save('/Users/david/VIfc pt2.npy', train_target)
+        np.save('/Users/david/VIfc true pt2.npy', regressed[:,0])
+        #plt.hist2d(train_target, regressed[:,0],bins =100,range=[[0,6000],[0,6000]], cmap = "hot_r")
+        plt.plot([min(jet_true_pt[:train_size]), max(jet_true_pt[:train_size])], [min(jet_true_pt[:train_size]), max(jet_true_pt[:train_size])], '--', color='blue', label='Line of Direct Proportionality', alpha = 0.5)
+        plt.title('Model Predictions vs Actual Values')
+        plt.xlabel('Actual Transverse Momentum (GeV)')
+        plt.ylabel('Predicted Transverse Momentum (GeV)')
+        plt.legend()
+        plt.savefig('/Users/david/Downloads/predictions_vs_actual_values_epoch_{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show()
+        
+        #1d histogram
+        #train_target2d= train_target[:, np.newaxis]
+        train_target2d = train_target
+        
+        #r = mu/jet_true_pt[:train_size]
+        delta = mu - train_target
+        
+        combined_data = np.concatenate([original_r, r])
+        data_min, data_max = np.min(combined_data), np.max(combined_data)   
+        
+        plt.figure()
+        ax = plt.gca()
+        ax.set_xlim([0.5, 1.5])
+        plt.hist(original_r, 100, range=(0.5, 1.5), label = "Uncalibrated Data",  alpha=0.7)
+        plt.hist(r, bins = 100, range = (0.5,1.5), label = "Norm. prob. fit",  alpha=0.7)
+        plt.xlabel("r")
+        plt.ylabel("Frequency")
+        plt.legend()
+        
+        #std cuts
+        stduppercut_r = r < 3*np.std(r)+np.mean(r)
+        stdlowercut_r = r > -3*np.std(r)+np.mean(r)
+        stdfullcut_r = stduppercut_r*stdlowercut_r
+        
+        #stduppercut_original_r = original_r < 3*np.std(original_r)+np.mean(original_r)
+        #stdlowercut_original_r = original_r > -3*np.std(original_r)+np.mean(original_r)
+        #stdfullcut_original_r = stduppercut_original_r * stdlowercut_original_r
+        
+        plt.text(0.7, 0.85, "mean = {:.3f}".format(np.mean(original_r)), transform=plt.gca().transAxes,verticalalignment='top', horizontalalignment='left', color = '#1f77b4')
+        plt.text(0.7, 0.8, "σ = {:.3f}".format(np.std(original_r)), transform=plt.gca().transAxes,verticalalignment='top', horizontalalignment='left', color = '#1f77b4')
+        plt.text(0.7, 0.75, "mean = {:.3f}".format(np.mean(r)), transform=plt.gca().transAxes,verticalalignment='top', horizontalalignment='left', color = '#ff7f0e')
+        plt.text(0.7, 0.7, "σ = {:.3f}".format(np.std(r[stdfullcut_r])), transform=plt.gca().transAxes,verticalalignment='top', horizontalalignment='left', color = '#ff7f0e')
+        #plt.grid(True)
+        #plt.title("r distribution")
+        plt.savefig('/Users/david/Downloads/1r distribution {}.pdf'.format(epoch+1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        
+        
+        #2d hist for mean r 
+        
+        #cuttings = [500,1000,1500,2000,2500,3000,3500,4000,4500,5000]
+        cuttings = np.linspace(0, 5000, 500)
+        cuttings = np.logspace(0, 3.7, 20)
+        cuttings = np.delete(cuttings,0)
+        #deletes the first element cuz 0 doesnt work also the 0 means first element not the number i think
+        
+        cuttings_eta = np.linspace(-2.5,2.5,20)
+        """
+        cut_parameter_list = []
+        firstcut = train_input<cuttings[0]
+        cut_parameter_list.append(r[firstcut])
+            
+        for i in range(len(cuttings)-1):
+                lower_cut = train_input>cuttings[i]
+                upper_cut = train_input<cuttings[i+1]
+                full_cut = lower_cut*upper_cut
+                cut_parameter_list.append(r[full_cut])
+        #finalcut = regressed>cuttings[len(cuttings)-1]
+        #cut_parameter_list.append(r[finalcut])
+        #cuz using midpoints of values cant have final cut to infinity
+        
+        # should be the seperated bins of r
+        
+        cut_parameter_list = np.array(cut_parameter_list)
+        cutmeanvalue = []
+        cutsigmavalue = []
+        for i in range(len(cut_parameter_list)):
+            total = 0
+            totalamount = 0
+            squaredmeanvaluediffsum = 0
+            for j in range(len(cut_parameter_list[i])):
+                totalamount += cut_parameter_list[i][j]
+                total += 1
+            mean = totalamount/total
+            for j in range(len(cut_parameter_list[i])):
+                squaredmeanvaluediffsum += (cut_parameter_list[i][j] - mean)**2
+            sigma = math.sqrt(squaredmeanvaluediffsum/total)
+            cutmeanvalue.append(mean)
+            cutsigmavalue.append(sigma)
+        
+        midpoints = [250,750,1250,1750,2250,2750,3250,3750,4250,4750]
+        plt.figure()
+        plt.errorbar(midpoints, cutmeanvalue, xerr = 250, alpha=0.7)
+        plt.title("mean r distribution")
+        plt.xlabel("pt")
+        plt.ylabel("<r>")
+        plt.grid(True)
+        plt.show
+        
+        plt.figure()
+        plt.errorbar(midpoints, cutsigmavalue, xerr = 250, alpha=0.7)
+        plt.title("mean sigma distribution")
+        plt.xlabel("pt")
+        plt.ylabel("sigma_r")
+        plt.grid(True)
+        plt.show
+        """
+        #midpoints,cutmeanvalue, cutsigmavalue = mean_sigma_cuttings(r, cuttings, jet_pt, exp= True)
+        midpoints,cutmeanvalue, cutsigmavalue = mean_sigma_cuttings(r, cuttings, mu, exp= True)
+        plt.figure()
+        plt.semilogx(midpoints, cutmeanvalue, alpha=0.7)
+        plt.title("mean r distribution")
+        
+        np.save('/Users/david/VIfc pt midpoints2.npy', midpoints)
+        np.save('/Users/david/VIfc pt cutmeanvalue2.npy', cutmeanvalue)
+        plt.xlabel("pt")
+        plt.ylabel("<r>")
+        #plt.grid(True)
+        plt.savefig('/Users/david/Downloads/1mean r distribution over pt{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        #same thing but scatter
+        fig = plt.figure()
+        ax = plt.gca()
+        ax.scatter(jet_true_pt[:train_size], r, alpha=0.7)
+        
+        ax.set_xscale("log");
+        plt.title("r distribution")
+        plt.xlabel("pt")
+        plt.ylabel("r")
+        #plt.grid(True)
+        plt.savefig('/Users/david/Downloads/1scatter r distribution over pt{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        
+        plt.figure()
+        ax = plt.gca()
+        ax.set_xscale("log");
+        plt.hist2d(jet_true_pt[:train_size],r, bins =100,cmap='viridis')
+        plt.savefig('/Users/david/Downloads/1scatter r distribution over pt-heatmap{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        plt.figure()
+        plt.semilogx(midpoints, cutsigmavalue, alpha=0.7)
+        plt.title("mean sigma distribution")
+        np.save('/Users/david/VIfc pt sigma midpoints2.npy', midpoints)
+        np.save('/Users/david/VIfc pt sigma cutmeanvalue2.npy', cutsigmavalue)
+        plt.xlabel("pt")
+        plt.ylabel("sigma_r")
+        #plt.grid(True)
+        plt.savefig('/Users/david/Downloads/1sigma r distribution over pt{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        #same things as above just with eta instead of pt
+        #eta creating issues of divide by 0 maybe need different cuttings for eta cuz only goes to like 2
+        
+        #midpoints,cutmeanvalue, cutsigmavalue = mean_sigma_cuttings(r, cuttings_eta, eta, exp= True, negatives=True )
+        midpoints,cutmeanvalue, cutsigmavalue = mean_sigma_cuttings(r, cuttings_eta, trainsizedeta, exp= True, negatives=True )
+        plt.figure()
+        plt.plot(midpoints, cutmeanvalue, alpha=0.7)
+        plt.title("mean r distribution")
+        
+        np.save('/Users/david/VIfc eta midpoints2.npy', midpoints)
+        np.save('/Users/david/VIfc eta cutmeanvalue2.npy', cutmeanvalue)
+        plt.xlabel("eta")
+        plt.ylabel("<r>")
+        #plt.grid(True)
+        plt.savefig('/Users/david/Downloads/1mean r distribution over eta{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        #same thing but scatter
+        fig = plt.figure()
+        ax = plt.gca()
+        ax.scatter(trainsizedeta, r, alpha=0.7)
+        plt.title("r distribution")
+        plt.xlabel("eta")
+        plt.ylabel("r")
+        #plt.grid(True)
+        plt.savefig('/Users/david/Downloads/1scatter r distribution over eta{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        plt.figure()
+        plt.hist2d(trainsizedeta,r, bins =100,cmap='viridis')
+        plt.savefig('/Users/david/Downloads/1scatter r distribution over eta-heatmap{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        
+        plt.figure()
+        plt.plot(midpoints, cutsigmavalue, alpha=0.7)
+        plt.title("mean sigma distribution")
+        np.save('/Users/david/VIfc eta sigma midpoints2.npy', midpoints)
+        np.save('/Users/david/VIfc eta sigma cutmeanvalue2.npy', cutsigmavalue)
+        plt.xlabel("eta")
+        plt.ylabel("sigma_r")
+        #plt.grid(True)
+        plt.savefig('/Users/david/Downloads/1 sigma r distribution over eta{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        plt.show
+        #pull = (mu-train_target)/np.exp(logsigma)
+        pull = (mu-jet_true_pt[:train_size])/(np.exp(logsigma)*jet_true_pt[:train_size])
+        finite_pull = pull[np.isfinite(pull)]
+        plt.figure()
+        plt.hist(pull,200,  alpha=0.7)
+        plt.xlabel("pull")
+        plt.ylabel("frequency")
+        plt.savefig('/Users/david/Downloads/pull{}.pdf'.format(epoch + 1), format="pdf", bbox_inches="tight")
+        #plt.grid(True)
+        plt.show
+
+  epoch += 1
+
+
